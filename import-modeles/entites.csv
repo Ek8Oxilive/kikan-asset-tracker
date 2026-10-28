@@ -1,5 +1,3 @@
-code;nom;code_parent;actif
+﻿code;nom;code_parent;actif
 GROUPE;SICA Atlantique;;oui
 SICA-AT;SICA Atlantique (siège);GROUPE;oui
-FILIALE-A;Filiale A;GROUPE;oui
-FILIALE-B;Filiale B;GROUPE;oui
