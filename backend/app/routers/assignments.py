@@ -16,6 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import hashlib
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -102,9 +103,13 @@ def create_assignment(data: AssignmentCreate, session: Session = Depends(get_ses
     if not data.asset_ids:
         raise HTTPException(400, "Au moins un actif est requis")
 
+    # Verrou sur les actifs jusqu'au commit : deux remises simultanees ne peuvent pas affecter le meme actif.
+    asset_ids = list(dict.fromkeys(data.asset_ids))
+    locked = {a.id: a for a in session.exec(
+        select(Asset).where(Asset.id.in_(asset_ids)).order_by(Asset.id).with_for_update()).all()}
     assets = []
-    for aid in data.asset_ids:
-        asset = session.get(Asset, aid)
+    for aid in asset_ids:
+        asset = locked.get(aid)
         if not asset:
             raise HTTPException(404, f"Actif {aid} introuvable")
         if asset.statut == AssetStatus.affecte:
@@ -128,8 +133,7 @@ def create_assignment(data: AssignmentCreate, session: Session = Depends(get_ses
         statut="en_cours",
     )
     session.add(assignment)
-    session.commit()
-    session.refresh(assignment)
+    session.flush()  # identifiant sans commit : les verrous sur les actifs restent poses
 
     for asset in assets:
         asset.statut = AssetStatus.affecte
@@ -197,7 +201,10 @@ def sign_assignment(
     session: Session = Depends(get_session),
     account: Account = Depends(get_current_account),
 ):
-    assignment = session.get(Assignment, assignment_id)
+    # Verrou sur l'affectation jusqu'au commit : une seconde validation (double appui sur la tablette)
+    # attend la premiere, puis voit sa signature et est refusee.
+    assignment = session.exec(
+        select(Assignment).where(Assignment.id == assignment_id).with_for_update()).first()
     if not assignment:
         raise HTTPException(404, "Affectation introuvable")
     if _already_signed(session, assignment_id):
@@ -256,7 +263,8 @@ def sign_assignment(
     empreinte = hashlib.sha256(sealed).hexdigest()
 
     # Rangement par annee (AAAA/...) sur le stockage actif (volume, partage SMB ou WebDAV).
-    reference = store_document(f"{now.year}/remise_{assignment_id}_{now:%Y%m%d%H%M%S}.pdf", sealed,
+    # Suffixe aleatoire : deux documents produits dans la meme seconde ne s'ecrasent jamais.
+    reference = store_document(f"{now.year}/remise_{assignment_id}_{now:%Y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}.pdf", sealed,
                                meta_for("Remise", now.year, assignment_id, entite, user, now))
 
     signature = Signature(
@@ -286,18 +294,33 @@ def sign_assignment(
 
 @router.get("/{assignment_id}/document")
 def get_document(assignment_id: int, type: str = Query("remise", pattern="^(remise|restitution)$"),
+                 signature_id: int | None = None,
                  session: Session = Depends(get_session), scope: Scope = Depends(scope_dep)):
     """PDF scelle de la remise (par defaut) ou de la restitution rattachee a cette affectation (?type=restitution).
 
-    Une affectation peut porter deux signatures (remise, puis restitution) : le choix est explicite et deterministe."""
-    visible_assignment(session, scope, assignment_id)
-    sigs = session.exec(select(Signature).where(Signature.assignment_id == assignment_id).order_by(Signature.id)).all()
+    Une affectation peut porter deux signatures (remise, puis restitution) : le choix est explicite et deterministe.
+    Une restitution qui couvre plusieurs affectations n'est enregistree que sur la premiere : elle est aussi retrouvee
+    depuis les autres. Apres plusieurs restitutions partielles, la plus recente est renvoyee (?signature_id= pour une autre)."""
+    assignment = visible_assignment(session, scope, assignment_id)
 
     def kind(sig):
+        declared = (sig.audit_json or {}).get("type")
+        if declared in ("remise", "restitution"):
+            return declared
         name = (sig.ged_reference or "").rsplit("/", 1)[-1]
         return "restitution" if name.startswith("restitution_") else "remise"
 
-    sig = next((x for x in sigs if kind(x) == type), None)
+    if type == "remise":
+        sigs = session.exec(select(Signature).where(Signature.assignment_id == assignment_id).order_by(Signature.id)).all()
+        candidates = [x for x in sigs if kind(x) == "remise"][:1]
+    else:
+        user_assignments = select(Assignment.id).where(Assignment.user_id == assignment.user_id)
+        sigs = session.exec(select(Signature).where(Signature.assignment_id.in_(user_assignments)).order_by(Signature.id)).all()
+        candidates = [x for x in sigs if kind(x) == "restitution" and (
+            x.assignment_id == assignment_id or assignment_id in ((x.audit_json or {}).get("assignments") or []))]
+    if signature_id is not None:
+        candidates = [x for x in candidates if x.id == signature_id]
+    sig = candidates[-1] if candidates else None
     if not sig or not sig.ged_reference:
         raise HTTPException(404, "Document scelle introuvable")
     data = read_document(sig.ged_reference)

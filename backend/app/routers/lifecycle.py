@@ -21,6 +21,7 @@ Accessible aux roles RH et informatique (la restitution peut etre conduite par
 l'un ou l'autre ; la remise a l'arrivee reste reservee a l'informatique).
 """
 import hashlib
+import uuid
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -144,6 +145,9 @@ def restituer(
     account: Account = Depends(get_current_account),
     scope: Scope = Depends(scope_dep),
 ):
+    # Verrou sur le salarie jusqu'au commit : deux restitutions simultanees (double appui) sont traitees
+    # l'une apres l'autre, la seconde ne voit plus le materiel deja rendu.
+    session.exec(select(User).where(User.id == data.user_id).with_for_update()).first()
     user = visible_user(session, scope, data.user_id)
 
     held = _holdings(session, data.user_id)
@@ -181,7 +185,8 @@ def restituer(
     empreinte = hashlib.sha256(sealed).hexdigest()
 
     # Rangement par annee (AAAA/...) sur le stockage actif (volume, partage SMB ou WebDAV).
-    reference = store_document(f"{now.year}/restitution_{data.user_id}_{now:%Y%m%d%H%M%S}.pdf", sealed,
+    # Suffixe aleatoire : deux restitutions dans la meme seconde ne s'ecrasent jamais.
+    reference = store_document(f"{now.year}/restitution_{data.user_id}_{now:%Y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}.pdf", sealed,
                                meta_for("Restitution", now.year, None, entite, user, now))
 
     # Marque les actifs rendus.

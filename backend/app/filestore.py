@@ -432,12 +432,15 @@ def read_document(reference: str) -> bytes:
     return get_backend(backend).read(key)
 
 
-def delete_document(reference: str) -> None:
+def delete_document(reference: str) -> bool:
+    """Supprime le document ; False si le stockage a refuse (l'appelant decide de journaliser ou de reessayer)."""
     try:
         backend, key = parse_reference(reference)
         get_backend(backend).delete(key)
     except StorageError as exc:
         log.warning("Suppression du document impossible : %s", exc)
+        return False
+    return True
 
 
 def _test_pdf(token: str) -> bytes:

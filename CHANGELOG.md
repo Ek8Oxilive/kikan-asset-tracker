@@ -24,6 +24,16 @@ Identité, intégrations et automatisation.
   images Docker (E5).
 
 ### Corrigé
+- **Purge RGPD** : un document que le stockage (SMB, SharePoint...) refusait de supprimer restait en place sans trace. Les références sont
+  désormais enregistrées avec la purge, chaque échec est journalisé et retenté à la purge suivante. La purge ne porte plus que sur la
+  liste affichée par la prévisualisation, elle est journalisée (nombre et matricules), et la durée de conservation ne peut plus descendre
+  sous 12 mois (`KIKAN_RETENTION_MIN_MOIS`).
+- Deux remises ou restitutions produites dans la même seconde pouvaient **écraser un PDF scellé** (même nom de fichier) : un suffixe
+  aléatoire est ajouté au nom.
+- Une double validation simultanée (double appui sur la tablette) pouvait produire **deux signatures** pour une même remise, ou affecter
+  deux fois le même actif : remise, signature et restitution verrouillent désormais les lignes concernées jusqu'à la fin de l'opération.
+- Une restitution couvrant **plusieurs remises** n'était retrouvable (`?type=restitution`) que depuis la première : elle l'est depuis
+  chacune. Après plusieurs restitutions partielles, la plus récente est renvoyée (`&signature_id=` pour une autre).
 - `GET /assignments/{id}/document` pouvait renvoyer le PDF de la **restitution** à la place de celui de la **remise** (une affectation porte
   deux signatures après une restitution et aucun ordre n'était imposé). Le choix est désormais déterministe (la remise par défaut) et la
   restitution se lit avec `?type=restitution`. Défaut découvert en rejouant l'enchaînement complet des suites (`tests/run_all.sh`).

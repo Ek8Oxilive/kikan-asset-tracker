@@ -23,6 +23,7 @@ Usage :
 Cree des donnees marquees ZZFN (a nettoyer ensuite). Code de sortie 1 si un test echoue.
 """
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -162,7 +163,26 @@ show("le salarie passe en 'sorti'", u2.get("statut") == "sorti")
 s, a1c = j("GET", f"/assets/{a1['id']}")
 show("les actifs passent en 'rendu'", a1c.get("statut") == "rendu")
 
+print("== Restitution couvrant plusieurs remises ==")
+s, um = j("POST", "/users", {"nom": "Multi", "prenom": "ZZFN", "matricule": "ZZFN4", "statut": "actif"})
+asgs = []
+for n in (1, 2):
+    s, am = j("POST", "/assets", {"type": "PC", "marque": "ZZFN-HP", "numero_serie": f"ZZFN-SNM{n}", "statut": "stock"})
+    s, asg = j("POST", "/assignments", {"user_id": um["id"], "asset_ids": [am["id"]]})
+    j("POST", f"/assignments/{asg['id']}/sign", SIGN)
+    asgs.append(asg)
+s, again = j("POST", f"/assignments/{asgs[0]['id']}/sign", SIGN)
+show("une remise deja signee ne se signe pas deux fois", s == 409, f"HTTP {s}")
+s, rm = j("POST", "/lifecycle/restituer", {"user_id": um["id"], **SIGN})
+show("restitution des deux remises en une signature", s == 201, f"HTTP {s}")
+for asg in asgs:
+    s, d = call("GET", f"/assignments/{asg['id']}/document?type=restitution", None, T)
+    show(f"restitution lisible depuis la remise {asg['id']}",
+         s == 200 and hashlib.sha256(d).hexdigest() == rm.get("empreinte_doc"), f"HTTP {s}")
+
 print("== Retention RGPD ==")
+s, _ = j("PUT", "/rgpd/retention", {"mois": 0})
+show("duree de conservation sous le minimum refusee", s == 422, f"HTTP {s}")
 j("PUT", "/rgpd/retention", {"mois": 36})
 s, old = j("POST", "/users", {"nom": "Ancien", "prenom": "ZZFN", "matricule": "ZZFN2", "statut": "sorti",
                                "date_sortie": "2019-01-01"})

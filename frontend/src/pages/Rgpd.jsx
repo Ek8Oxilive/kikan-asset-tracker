@@ -25,11 +25,15 @@ export default function Rgpd() {
   const { user } = useAuth();
   const writable = canWrite(user.role, "entites"); // informatique
   const [mois, setMois] = useState(36);
+  const [minimum, setMinimum] = useState(12);
   const [preview, setPreview] = useState(null);
   const [err, setErr] = useState(null);
   const [msg, setMsg] = useState(null);
 
-  useEffect(() => { api.get("/rgpd/retention").then((r) => setMois(r.mois)).catch((e) => setErr(e.message)); }, []);
+  useEffect(() => {
+    api.get("/rgpd/retention").then((r) => { setMois(r.mois); if (r.minimum != null) setMinimum(r.minimum); })
+      .catch((e) => setErr(e.message));
+  }, []);
 
   const saveMois = async () => {
     setErr(null); setMsg(null);
@@ -48,8 +52,11 @@ export default function Rgpd() {
     if (!window.confirm(`Supprimer definitivement ${preview.count} salarie(s) sorti(s) et leurs donnees ? Action irreversible.`)) return;
     setErr(null);
     try {
-      const r = await api.post("/rgpd/purge", {});
-      setMsg(`${r.count} salarie(s) supprime(s).`);
+      // Seule la liste affichee est purgee (un salarie devenu candidat entre-temps attend la prochaine fois).
+      const r = await api.post("/rgpd/purge", { ids: preview.candidats.map((c) => c.id) });
+      setMsg(`${r.count} salarie(s) supprime(s).` + (r.documents_en_attente
+        ? ` ${r.documents_en_attente} document(s) n'ont pas pu etre supprimes du stockage : nouvel essai a la prochaine purge.`
+        : ""));
       setPreview(null);
     } catch (e) { setErr(e.message); }
   };
@@ -66,10 +73,10 @@ export default function Rgpd() {
         <h3>Duree de conservation apres sortie</h3>
         <div className="row">
           <label style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <input type="number" min="0" value={mois} onChange={(e) => setMois(e.target.value)} style={{ width: 90 }} /> mois
+            <input type="number" min={minimum} value={mois} onChange={(e) => setMois(e.target.value)} style={{ width: 90 }} /> mois
           </label>
           <button onClick={saveMois}>Enregistrer</button>
-          <span className="muted">Un salarie sorti est conserve jusqu'a sa date de sortie + cette duree.</span>
+          <span className="muted">Un salarie sorti est conserve jusqu'a sa date de sortie + cette duree ({minimum} mois minimum).</span>
         </div>
       </div>
 

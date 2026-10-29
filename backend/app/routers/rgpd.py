@@ -18,18 +18,25 @@
 """Retention RGPD : duree parametrable, previsualisation et purge des salaries sortis.
 
 La suppression est en deux temps : previsualisation (liste) puis purge explicite
-(validee par l'admin dans l'interface).
+(validee par l'admin dans l'interface). La purge ne porte que sur la liste validee a l'ecran, et
+chaque purge est journalisee (nombre et matricules). Un document que le stockage refuse de
+supprimer est garde en file d'attente et retente a la purge suivante.
 """
 import calendar
+import json
+import os
 from datetime import date
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
+from .. import appsettings
+from ..audit import audit
 from ..auth import require_roles
 from ..db import get_session
 from ..models import (
+    Account,
     Assignment,
     AssignmentAsset,
     Besoin,
@@ -48,17 +55,25 @@ router = APIRouter(
 
 RETENTION_KEY = "retention_apres_sortie_mois"
 RETENTION_DEFAUT = 36  # 3 ans
+# Plancher : les accuses de restitution signes (A.5.11) ne s'effacent pas au lendemain de la sortie.
+RETENTION_MIN = int(os.environ.get("KIKAN_RETENTION_MIN_MOIS", "12"))
+PENDING_KEY = "rgpd_documents_a_supprimer"  # references que le stockage a refuse de supprimer
 
 
 class RetentionSetting(BaseModel):
     mois: int
 
 
+class PurgeRequest(BaseModel):
+    # Identifiants affiches par la previsualisation : seuls ceux-la sont purges (absent : tous les candidats).
+    ids: list[int] | None = Field(default=None, max_length=10000)
+
+
 def _get_retention(session: Session) -> int:
     row = session.get(Setting, RETENTION_KEY)
     if row and row.value and row.value.isdigit():
-        return int(row.value)
-    return RETENTION_DEFAUT
+        return max(RETENTION_MIN, int(row.value))  # une valeur enregistree avant le plancher est relevee
+    return max(RETENTION_MIN, RETENTION_DEFAUT)
 
 
 def _add_months(d: date, months: int) -> date:
@@ -85,13 +100,15 @@ def _candidats(session: Session) -> list[User]:
 
 @router.get("/retention")
 def get_retention(session: Session = Depends(get_session)):
-    return {"mois": _get_retention(session)}
+    return {"mois": _get_retention(session), "minimum": RETENTION_MIN}
 
 
 @router.put("/retention")
-def set_retention(data: RetentionSetting, session: Session = Depends(get_session)):
-    if data.mois < 0:
-        data.mois = 0
+def set_retention(data: RetentionSetting, session: Session = Depends(get_session),
+                  admin: Account = Depends(require_roles("informatique"))):
+    if data.mois < RETENTION_MIN:
+        raise HTTPException(422, f"Duree de conservation trop courte ({RETENTION_MIN} mois minimum)")
+    before = _get_retention(session)
     row = session.get(Setting, RETENTION_KEY)
     if row:
         row.value = str(data.mois)
@@ -99,7 +116,16 @@ def set_retention(data: RetentionSetting, session: Session = Depends(get_session
         row = Setting(key=RETENTION_KEY, value=str(data.mois))
     session.add(row)
     session.commit()
-    return {"mois": data.mois}
+    audit(admin.username, "rgpd_retention", detail=f"{before} -> {data.mois} mois")
+    return {"mois": data.mois, "minimum": RETENTION_MIN}
+
+
+def _pending_documents(session: Session) -> list[str]:
+    try:
+        refs = json.loads(appsettings.get(session, PENDING_KEY, "") or "[]")
+    except ValueError:
+        return []
+    return [r for r in refs if isinstance(r, str)]
 
 
 @router.get("/purge-preview")
@@ -109,6 +135,7 @@ def purge_preview(session: Session = Depends(get_session)):
     return {
         "retention_mois": retention,
         "count": len(candidats),
+        "documents_en_attente": len(_pending_documents(session)),
         "candidats": [
             {"id": u.id, "matricule": u.matricule, "nom": u.nom, "prenom": u.prenom,
              "date_sortie": str(u.date_sortie),
@@ -119,8 +146,14 @@ def purge_preview(session: Session = Depends(get_session)):
 
 
 @router.post("/purge")
-def purge(session: Session = Depends(get_session)):
+def purge(data: PurgeRequest | None = None, session: Session = Depends(get_session),
+          admin: Account = Depends(require_roles("informatique"))):
     candidats = _candidats(session)
+    if data is not None and data.ids is not None:
+        # Recalcul a l'instant de la purge, restreint a la liste validee : un salarie devenu candidat
+        # depuis la previsualisation n'est pas supprime sans avoir ete montre.
+        valides = set(data.ids)
+        candidats = [u for u in candidats if u.id in valides]
     supprimes = []
     documents: list[str] = []
     for user in candidats:
@@ -153,10 +186,23 @@ def purge(session: Session = Depends(get_session)):
         ).all():
             session.delete(ua)
         session.flush()
-        supprimes.append({"id": user.id, "nom": user.nom, "prenom": user.prenom})
+        supprimes.append({"id": user.id, "matricule": user.matricule, "nom": user.nom, "prenom": user.prenom})
         session.delete(user)
+    # Les references a supprimer sont enregistrees avec la purge (meme transaction) : un arret ou un
+    # stockage indisponible ne laisse pas de PDF orphelin sans trace.
+    a_supprimer = list(dict.fromkeys(_pending_documents(session) + documents))
+    appsettings.put(session, PENDING_KEY, json.dumps(a_supprimer))
     session.commit()
+    if supprimes:
+        audit(admin.username, "rgpd_purge", detail=(
+            f"{len(supprimes)} salarie(s), {len(documents)} document(s) ; matricules : "
+            + ", ".join(s["matricule"] or f"id {s['id']}" for s in supprimes))[:2000])
     # Fichiers supprimes seulement une fois la base validee (volume local, partage SMB ou WebDAV).
-    for reference in documents:
-        delete_document(reference)
-    return {"supprimes": supprimes, "count": len(supprimes), "documents_supprimes": len(documents)}
+    echecs = [ref for ref in a_supprimer if not delete_document(ref)]
+    for ref in echecs:
+        audit("systeme", "rgpd_document_non_supprime", target=ref, status=503,
+              detail="stockage indisponible : nouvel essai a la prochaine purge")
+    appsettings.put(session, PENDING_KEY, json.dumps(echecs))
+    session.commit()
+    return {"supprimes": supprimes, "count": len(supprimes),
+            "documents_supprimes": len(a_supprimer) - len(echecs), "documents_en_attente": len(echecs)}
